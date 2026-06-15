@@ -74,7 +74,7 @@ main.py            ← training loop (imports all above)
 
 - **ε-prediction, not x₀-prediction.** The UNet estimates the noise that was added, matching the DDPM "simple" objective. This works better in practice than predicting x₀ directly.
 - **BF16 mixed precision via `torch.amp.autocast`.** RTX 5080 (Blackwell) runs BF16 natively. No `GradScaler` needed for BF16 (unlike FP16) — the scaler is included as a harmless safety net.
-- **EMA with decay 0.9999.** During training, an exponential moving average of weights is maintained. Sampling always uses EMA weights; they are applied/restored around each sample step.
+- **EMA with warmup + decay 0.9999.** During training, an exponential moving average of weights is maintained. Sampling always uses EMA weights; they are applied/restored around each sample step. A dynamic warmup schedule (`current_decay = min(0.9999, (1+step)/(10+step))`) prevents the shadow model from retaining too much random initial weight early in training — without this, early samples are pure-colour blocks.
 - **Linear β schedule from 1e-4 to 0.02.** The simplest schedule that works. A `cosine_beta_schedule` is already implemented in `diffusion.py` for the next experiment (Improved DDPM).
 - **Self-attention only at resolution ≤ 16.** For 32×32 input this means attention at 16×16, 8×8, 4×4 layers and bottleneck — but not at 32×32 (saves parameters).
 - **Channel multipliers [1, 2, 2, 2] with base 128.** Produces ~27M parameters. The up-block first ResBlock concatenates skip connection, so its input channels = in_ch + skip_ch.
@@ -102,9 +102,11 @@ Time embedding: sinusoidal encoding → Linear(128→512) → SiLU → Linear(51
 All stored as 1-D tensors of length `T` on CPU (moved to correct device inside `_extract`). Key tensors:
 - `sqrt_alphas_cumprod` — scale x₀ in forward diffusion
 - `sqrt_one_minus_alphas_cumprod` — scale ε in forward diffusion
-- `sqrt_recip_alphas` — `1/√α_t` for sampling mean
-- `coef_eps` — `β_t / √(1−ᾱ_t)` multiplier on predicted noise in sampling
+- `sqrt_recip_alphas_cumprod` / `sqrt_recipm1_alphas_cumprod` — recover predicted x₀ from ε
+- `posterior_mean_coef1` / `posterior_mean_coef2` — posterior mean from clipped x₀ (Improved DDPM eq. 9)
 - `posterior_variance` — `β̃_t` for sampling variance
+
+**x₀ clipping in `p_sample`:** Before computing the posterior mean, the predicted x₀ is recovered from ε and clipped to `[-1, 1]`. This prevents numerical explosion when the model's noise prediction is imperfect — essential for the cosine schedule where β at high t can exceed 0.8.
 
 ### Checkpoint format
 

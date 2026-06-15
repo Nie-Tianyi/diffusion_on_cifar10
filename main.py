@@ -38,6 +38,10 @@ class EMA:
 
     Inference is done with the EMA shadow weights, which gives noticeably
     better sample quality for essentially zero cost.
+
+    Includes a warmup schedule: early in training the effective decay is
+    lower so the shadow model can catch up to the current weights quickly,
+    avoiding catastrophic "random weight residue" that ruins early samples.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.9999):
@@ -46,6 +50,7 @@ class EMA:
         self.shadow: dict[str, torch.Tensor] = {}
         self.backup: dict[str, torch.Tensor] = {}
         self._registered = False
+        self._step = 0
 
     def _register(self) -> None:
         for name, param in self.model.named_parameters():
@@ -56,9 +61,16 @@ class EMA:
     def update(self) -> None:
         if not self._registered:
             self._register()
+
+        self._step += 1
+        # Warmup: ramp decay from ~0.09 (step 1) → 0.9999 over time.
+        # After 7800 steps the residue of initial random weights is <1%
+        # instead of ~46% with a fixed 0.9999 decay.
+        current_decay = min(self.decay, (1 + self._step) / (10 + self._step))
+
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                self.shadow[name] = current_decay * self.shadow[name] + (1.0 - current_decay) * param.data
 
     def apply_shadow(self) -> None:
         for name, param in self.model.named_parameters():
@@ -73,11 +85,12 @@ class EMA:
         self.backup.clear()
 
     def state_dict(self) -> dict:
-        return {"shadow": self.shadow, "decay": self.decay}
+        return {"shadow": self.shadow, "decay": self.decay, "step": self._step}
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.shadow = state_dict["shadow"]
         self.decay = state_dict["decay"]
+        self._step = state_dict.get("step", 0)
         self._registered = True
 
 
@@ -174,14 +187,21 @@ def train(cfg: Config, resume: str | None = None):
         timesteps=tc.timesteps,
         beta_start=tc.beta_start,
         beta_end=tc.beta_end,
+        schedule=tc.schedule,
     )
 
     # ── Optimiser ──
     optimizer = optim.Adam(model.parameters(), lr=tc.lr)
 
-    # ── AMP scaler (only needed for FP16; harmless but optional for BF16) ──
-    scaler = GradScaler("cuda") if tc.use_amp and device.type == "cuda" else None
-    amp_dtype = torch.bfloat16 if (tc.use_amp and device.type == "cuda") else None
+    # ── AMP dtype & scaler ──
+    # BF16 has enough dynamic range that GradScaler is unnecessary (and can
+    # occasionally cause skipped updates). Only use scaler for FP16.
+    if tc.use_amp and device.type == "cuda":
+        amp_dtype = torch.bfloat16
+        scaler = GradScaler("cuda") if amp_dtype == torch.float16 else None
+    else:
+        amp_dtype = None
+        scaler = None
 
     # ── Data ──
     dataloader = make_dataloader(tc, train=True)

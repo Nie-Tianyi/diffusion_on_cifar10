@@ -27,6 +27,7 @@ class TrainingConfig:
     timesteps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
+    schedule: str = "cosine"  # "linear" or "cosine"
 
     # Optimisation
     batch_size: int = 256
