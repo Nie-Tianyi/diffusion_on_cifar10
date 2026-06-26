@@ -10,7 +10,7 @@ import argparse
 import torch.nn as nn
 
 from config import cifar10_config
-from model import UNet, AttentionBlock
+from unet import UNet, AttentionBlock
 
 
 def fmt_params(n: int) -> str:

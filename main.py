@@ -18,15 +18,24 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler # type: ignore
 import torchvision
 import torchvision.transforms as T
 from tqdm import tqdm
 
 from config import Config, TrainingConfig, cifar10_config
-from model import UNet
+from unet import UNet
 from diffusion import GaussianDiffusion
 from sampling import sample_and_save
+
+
+def _create_model(config: "Config") -> "nn.Module":
+    """Factory: return the right noise-prediction model based on config.model_type."""
+    mc = config.model
+    if config.model_type == "dit":
+        from dit import DiT
+        return DiT(mc)
+    return UNet(mc)
 
 
 # ---------------------------------------------------------------------------
@@ -127,14 +136,16 @@ def make_dataloader(config: TrainingConfig, train: bool = True) -> DataLoader:
 
 def save_checkpoint(
     path: str,
-    model: UNet,
+    model: nn.Module,
     ema: EMA,
     optimizer: optim.Optimizer,
     scaler: GradScaler | None,
     epoch: int,
     step: int,
+    model_type: str = "unet",
 ):
     checkpoint = {
+        "model_type": model_type,
         "model": model.state_dict(),
         "ema": ema.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -147,7 +158,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: str,
-    model: UNet,
+    model: nn.Module,
     ema: EMA,
     optimizer: optim.Optimizer | None = None,
     scaler: GradScaler | None = None,
@@ -176,7 +187,7 @@ def train(cfg: Config, resume: str | None = None):
     mc, tc = cfg.model, cfg.training
 
     # ── Model ──
-    model = UNet(mc).to(device)
+    model = _create_model(cfg).to(device)
     ema = EMA(model, tc.ema_decay)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -287,12 +298,12 @@ def train(cfg: Config, resume: str | None = None):
 
         if (epoch + 1) % tc.save_interval == 0:
             ckpt_path = os.path.join(ckpt_dir, f"checkpoint_epoch_{epoch+1:04d}.pt")
-            save_checkpoint(ckpt_path, model, ema, optimizer, scaler, epoch, global_step)
+            save_checkpoint(ckpt_path, model, ema, optimizer, scaler, epoch, global_step, cfg.model_type)
             print(f"  → saved {ckpt_path}")
 
     # ── Final checkpoint ──
     final_path = os.path.join(ckpt_dir, "final.pt")
-    save_checkpoint(final_path, model, ema, optimizer, scaler, tc.epochs - 1, global_step)
+    save_checkpoint(final_path, model, ema, optimizer, scaler, tc.epochs - 1, global_step, cfg.model_type)
     print(f"Done! Final checkpoint → {final_path}")
 
     # ── Final sample with EMA ──
@@ -331,6 +342,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sampler", type=str, default=None, choices=["ddpm", "ddim"], help="Sampling method")
     p.add_argument("--ddim-steps", type=int, default=None, help="DDIM sampling steps")
     p.add_argument("--ddim-eta", type=float, default=None, help="DDIM stochasticity (0=deterministic)")
+    p.add_argument("--model", type=str, default=None, choices=["unet", "dit"], help="Model architecture")
     args = p.parse_args()
     return args
 
@@ -354,8 +366,12 @@ def main():
         cfg.training.ddim_steps = args.ddim_steps
     if args.ddim_eta is not None:
         cfg.training.ddim_eta = args.ddim_eta
+    if args.model is not None:
+        cfg.model_type = args.model
 
     # Dump config
+    print("=" * 50)
+    print(f"Model type: {cfg.model_type}")
     print("=" * 50)
     print("Training config")
     print("=" * 50)

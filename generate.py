@@ -24,8 +24,9 @@ from datetime import datetime
 import torch
 from torchvision.utils import save_image
 
-from config import Config, cifar10_config
-from model import UNet
+from config import Config, cifar10_config, dit_s_config, dit_b_config
+from unet import UNet
+from dit import DiT
 from diffusion import GaussianDiffusion
 from main import EMA  # EMA lives in main.py
 
@@ -42,14 +43,26 @@ def generate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    cfg = cifar10_config()
+    # ── Load checkpoint (read model_type before creating model) ──
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_type = ckpt.get("model_type", "unet")  # backward compat: old checkpoints are UNet
+    print(f"Checkpoint model_type: {model_type}")
+
+    # Choose config matching the checkpoint's architecture
+    if model_type == "dit":
+        # Try to infer DiT size from state dict; default to DiT-S
+        cfg = dit_s_config()
+    else:
+        cfg = cifar10_config()
 
     # ── Model ──
-    model = UNet(cfg.model).to(device)
+    if model_type == "dit":
+        model = DiT(cfg.model).to(device)
+    else:
+        model = UNet(cfg.model).to(device)
     ema = EMA(model, cfg.training.ema_decay)
 
-    # ── Load checkpoint ──
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # ── Load weights ──
     model.load_state_dict(ckpt["model"])
     ema.load_state_dict(ckpt["ema"])
     print(f"Loaded checkpoint: {checkpoint_path}")

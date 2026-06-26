@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-DDPM diffusion model training pipeline for CIFAR-10. Implements the Denoising Diffusion Probabilistic Models paper (Ho et al. 2020): a U-Net predicts noise added to images, trained with the simple MSE objective. Target hardware is an RTX 5080 16 GB, but the code auto-scales to any GPU or CPU.
+DDPM diffusion model training pipeline for CIFAR-10. Implements the Denoising Diffusion Probabilistic Models paper (Ho et al. 2020) with two backbone choices: a convolutional U-Net and a DiT (Diffusion Transformer, Peebles & Xie 2023). Target hardware is an RTX 5080 16 GB, but the code auto-scales to any GPU or CPU.
 
 ## Commands
 
@@ -30,11 +30,38 @@ uv run python main.py --sampler ddim --ddim-steps 50
 # DDIM with stochasticity (eta=1 recovers DDPM behaviour)
 uv run python main.py --sampler ddim --ddim-steps 100 --ddim-eta 1.0
 
+# Train with DiT-Small (~33M params, comparable to UNet)
+uv run python main.py --model dit
+
+# Train with DiT-Base (~131M params, higher quality)
+uv run python main.py --model dit --batch-size 128
+
+# Generate images from a DiT checkpoint
+uv run python generate.py --checkpoint outputs/<run_id>/checkpoints/final.pt
+
+# DiT smoke test
+uv run python -c "
+import torch
+from config import dit_s_config
+from dit import DiT
+from diffusion import GaussianDiffusion
+cfg = dit_s_config()
+model = DiT(cfg.model).cuda()
+diff = GaussianDiffusion(cfg.training.timesteps, cfg.training.beta_start, cfg.training.beta_end)
+x = torch.randn(8, 3, 32, 32, device='cuda')
+t = torch.randint(0, 1000, (8,), device='cuda')
+print(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M')
+print(f'Loss: {diff.p_losses(model, x, t).item():.4f}')
+with torch.no_grad():
+    s = diff.ddim_sample_loop(model, (4, 3, 32, 32), 'cuda', ddim_steps=50)
+    print(f'Sample shape: {s.shape}')
+"
+
 # Smoke test — verify model init, forward pass, and sampling all work
 uv run python -c "
 import torch
 from config import cifar10_config
-from model import UNet
+from unet import UNet
 from diffusion import GaussianDiffusion
 cfg = cifar10_config()
 model = UNet(cfg.model).cuda()
@@ -57,9 +84,9 @@ with torch.no_grad():
 CIFAR-10 image (3×32×32, [-1,1])
   → random timestep t ~ Uniform(0, T-1)
   → forward diffusion: x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε  (no ε needed if predicting noise)
-  → UNet predicts noise ε_θ(x_t, t)
+  → Model (UNet or DiT) predicts noise ε_θ(x_t, t)
   → MSE loss between ε_θ and true ε
-  → backprop through UNet only
+  → backprop through model only
 ```
 
 **Sampling (reverse process):** two samplers available:
@@ -73,13 +100,15 @@ Both use EMA shadow weights for better quality. x₀ clipping to [-1, 1] is appl
 
 ```
 config.py          ← dataclasses: ModelConfig, TrainingConfig, Config
-model.py           ← UNet (imports ModelConfig from config)
+unet.py           ← UNet (imports ModelConfig from config)
+dit.py             ← DiT (imports ModelConfig from config)
 diffusion.py       ← GaussianDiffusion (standalone, no project imports)
 sampling.py        ← sample_and_save (imports GaussianDiffusion)
 main.py            ← training loop (imports all above)
+generate.py        ← standalone inference (imports model/dit + diffusion)
 ```
 
-`diffusion.py` and `model.py` are the two core modules; neither imports the other — the training loop wires them together.
+`diffusion.py` and `unet.py`/`dit.py` are independent; the training loop wires them together.
 
 ### Key design choices
 
@@ -107,6 +136,44 @@ Out:      GroupNorm + SiLU + Conv → 3, 32×32
 ```
 
 Time embedding: sinusoidal encoding → Linear(128→512) → SiLU → Linear(512→512), injected into each ResBlock via `h + time_proj(silu(t_emb))`.
+
+### DiT architecture
+
+DiT (Diffusion Transformer, Peebles & Xie 2023) replaces the convolutional U-Net with a Vision Transformer that uses **adaLN-Zero** (adaptive layer norm with zero-initialized modulation) to condition on diffusion timesteps.
+
+```
+Image (3×32×32)
+  → PatchEmbed: Conv2d(3→384, k=4, s=4)     → (B, 384, 8, 8)
+  → flatten + transpose                       → (B, 64, 384) tokens
+  → + fixed 2D sinusoidal position embed
+  → TimeEmbed: sin-cos(256) → SiLU → Linear  → c (B, 384)
+  → 12× DiTBlock(x, c):
+      ┌─ LayerNorm (no affine)
+      │  → modulate: x·(1+γ₁) + β₁  (γ₁,β₁ from adaLN_modulation(c))
+      │  → MultiheadAttention(384, 6 heads)
+      │  → scale by gate α₁  (from adaLN_modulation(c))
+      │  → residual add
+      ├─ LayerNorm (no affine)
+      │  → modulate: x·(1+γ₂) + β₂  (γ₂,β₂ from adaLN_modulation(c))
+      │  → MLP: Linear(384→1536) → GELU → Linear(1536→384)
+      │  → scale by gate α₂  (from adaLN_modulation(c))
+      └─ → residual add
+  → FinalLayer: LayerNorm → modulate → Linear(384→48)
+  → unpatchify                               → (B, 3, 32, 32) predicted noise
+```
+
+**adaLN-Zero:** Each `DiTBlock` has a small modulation MLP `SiLU → Linear(384→2304)` that projects the conditioning vector `c` into 6 parameters: (shift, scale, gate) × (MSA sub-layer, MLP sub-layer). The output Linear is **zero-initialized** so all modulation params start at 0 → each block is an identity function at the start of training. This is the key innovation that makes transformer diffusion training stable.
+
+**Position embedding:** Fixed 2D sinusoidal (not learned). Row and column positions each get half the embedding dimension via sin/cos at logarithmically-spaced frequencies. Registered as a non-trainable buffer.
+
+**DiT config presets:**
+
+| Preset | Hidden | Depth | Heads | Params | VRAM (bs=256) |
+|--------|--------|-------|-------|--------|---------------|
+| DiT-S  | 384    | 12    | 6     | ~33M   | ~4-5 GB       |
+| DiT-B  | 768    | 12    | 12    | ~131M  | ~8-10 GB      |
+
+Use `dit_s_config()` or `dit_b_config()` to get a pre-built `Config`. Or use `--model dit` at the CLI (defaults to DiT-S).
 
 ### Diffusion precomputed coefficients
 
@@ -144,6 +211,7 @@ where `x̂₀` is recovered from the predicted noise and clipped to [-1, 1], and
 
 ```python
 {
+    "model_type": "unet" | "dit",     # model architecture
     "model": model.state_dict(),
     "ema": {"shadow": {...}, "decay": 0.9999},
     "optimizer": optimizer.state_dict(),
@@ -172,4 +240,5 @@ outputs/
 - **Improved DDPM (cosine schedule + learned variance):** already using cosine schedule by default; swap UNet `out_channels` from 3 to 6 (mean + variance per channel) and add a learned-variance loss term.
 - **DDIM accelerated sampling:** ✅ already implemented (`ddim_sample` / `ddim_sample_loop`). Use `--sampler ddim --ddim-steps 50` at the CLI.
 - **Larger resolution / Latent Diffusion:** increase `image_size` and adjust `channel_multipliers` for more down-sample stages. For 64×64 use multipliers `[1, 1, 2, 2, 2]`.
-- **Conditional generation:** add class embedding to the UNet (similar to time embedding) and train with labels.
+- **DiT (Diffusion Transformer):** ✅ already implemented. Use `--model dit` at the CLI or `dit_s_config()` / `dit_b_config()` in code. See DiT architecture section above.
+- **Conditional generation:** add class embedding to the UNet or DiT (similar to time embedding) and train with labels.
