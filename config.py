@@ -27,7 +27,7 @@ class ModelConfig:
     dit_depth: int = 12              # number of transformer blocks
     dit_num_heads: int = 6           # MHA heads
     dit_mlp_ratio: float = 4.0       # MLP hidden / transformer hidden
-    dit_patch_size: int = 4          # patch size for tokenisation (32→8×8 grid)
+    dit_patch_size: int = 2          # patch size for tokenisation (32→16×16 grid)
 
 
 @dataclass
@@ -102,7 +102,7 @@ def dit_s_config() -> Config:
         dit_depth=12,
         dit_num_heads=6,
         dit_mlp_ratio=4.0,
-        dit_patch_size=4,
+        dit_patch_size=2,
     )
     return cfg
 
@@ -122,6 +122,6 @@ def dit_b_config() -> Config:
         dit_depth=12,
         dit_num_heads=12,
         dit_mlp_ratio=4.0,
-        dit_patch_size=4,
+        dit_patch_size=2,
     )
     return cfg

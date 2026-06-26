@@ -143,8 +143,8 @@ DiT (Diffusion Transformer, Peebles & Xie 2023) replaces the convolutional U-Net
 
 ```
 Image (3×32×32)
-  → PatchEmbed: Conv2d(3→384, k=4, s=4)     → (B, 384, 8, 8)
-  → flatten + transpose                       → (B, 64, 384) tokens
+  → PatchEmbed: Conv2d(3→384, k=2, s=2)     → (B, 384, 16, 16)
+  → flatten + transpose                       → (B, 256, 384) tokens
   → + fixed 2D sinusoidal position embed
   → TimeEmbed: sin-cos(256) → SiLU → Linear  → c (B, 384)
   → 12× DiTBlock(x, c):
@@ -158,7 +158,7 @@ Image (3×32×32)
       │  → MLP: Linear(384→1536) → GELU → Linear(1536→384)
       │  → scale by gate α₂  (from adaLN_modulation(c))
       └─ → residual add
-  → FinalLayer: LayerNorm → modulate → Linear(384→48)
+  → FinalLayer: LayerNorm → modulate → Linear(384→12)
   → unpatchify                               → (B, 3, 32, 32) predicted noise
 ```
 
@@ -166,14 +166,14 @@ Image (3×32×32)
 
 **Position embedding:** Fixed 2D sinusoidal (not learned). Row and column positions each get half the embedding dimension via sin/cos at logarithmically-spaced frequencies. Registered as a non-trainable buffer.
 
-**DiT config presets:**
+**DiT config presets (patch_size=2, 16×16 grid):**
 
 | Preset | Hidden | Depth | Heads | Params | VRAM (bs=256) |
 |--------|--------|-------|-------|--------|---------------|
-| DiT-S  | 384    | 12    | 6     | ~33M   | ~4-5 GB       |
-| DiT-B  | 768    | 12    | 12    | ~131M  | ~8-10 GB      |
+| DiT-S  | 384    | 12    | 6     | ~32.5M | ~5-6 GB       |
+| DiT-B  | 768    | 12    | 12    | ~130M  | ~10-12 GB     |
 
-Use `dit_s_config()` or `dit_b_config()` to get a pre-built `Config`. Or use `--model dit` at the CLI (defaults to DiT-S).
+Use `dit_s_config()` or `dit_b_config()` to get a pre-built `Config`. Or use `--model dit` at the CLI (defaults to DiT-S with patch_size=2).
 
 ### Diffusion precomputed coefficients
 
